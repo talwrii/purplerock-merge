@@ -549,6 +549,20 @@ def cmd_watch(args):
 
     watch_tree(vault)
 
+    # On startup, give a first version to any note that has no history yet, so
+    # watch needs no prior `record` and nothing sits untracked. Notes that
+    # already have history are left alone (their next edit is caught below).
+    versioned = 0
+    for rel, _ in iter_md_files(vault):
+        if store.head(rel) is None:
+            try:
+                if record_note(store, vault, rel) is not None:
+                    versioned += 1
+            except OSError:
+                continue
+    if versioned:
+        print(f"first version created for {versioned} untracked note(s)", flush=True)
+
     pending = set()
     first = last = None
     print(f"watching {vault}  ({len(wd_to_dir)} dirs, quiet={args.quiet}s, "
