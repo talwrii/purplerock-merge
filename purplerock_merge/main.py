@@ -383,6 +383,19 @@ def cmd_log(args):
         print(f"{e['time']}  {short(e['hash'])}  <-[{parents}]  {e['path']}")
 
 
+def cmd_show(args):
+    store = Store.for_vault(args.store_root, args.vault)
+    if not os.path.isdir(store.objects):
+        die(f"no store at {store.root}")
+    matches = [o for o in os.listdir(store.objects)
+               if o.startswith(args.hash) and not o.endswith(".tmp")]
+    if not matches:
+        die(f"no version with hash prefix {args.hash!r}")
+    if len(matches) > 1:
+        die(f"ambiguous hash prefix {args.hash!r} ({len(matches)} matches)")
+    sys.stdout.buffer.write(store.read_object(matches[0]))
+
+
 def _atomic_write(path, data):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     tmp = path + ".prm-tmp"
@@ -391,99 +404,144 @@ def _atomic_write(path, data):
     os.replace(tmp, path)
 
 
-def cmd_merge(args):
-    A = os.path.abspath(args.vault_a)
-    B = os.path.abspath(args.vault_b)
-    nameA, nameB = os.path.basename(A), os.path.basename(B)
-    storeA = Store.for_vault(args.store_root, A)
-    storeB = Store.for_vault(args.store_root, B)
-    storeA.ensure()
-    storeB.ensure()
+# --- reconcile within one store --------------------------------------------
+#
+# One store, keyed by full path under the top dir. A merge rule reconciles a
+# note under one subtree with the same-named note under another subtree:
+#
+#     gaendagod/gaendagod <-> mantlegod/mantlegod : children(my possessions)
+#
+# Because the projector copies exact bytes, the two paths' histories share the
+# content hashes they've exchanged -- so the most recent hash common to both is
+# the three-way merge base, for free. Blobs are pooled, so nothing is copied
+# between stores.
 
-    pathsA, pathsB = md_paths(A), md_paths(B)
-    if args.selector:
-        members = select(A, args.selector) | select(B, args.selector)
-    else:
-        members = pathsA | pathsB
-
-    def note_action(msg):
-        print(msg)
-
-    for rel in sorted(members):
-        inA, inB = rel in pathsA, rel in pathsB
-
-        if inA and not inB:
-            data = storeA.read_object(storeA.head(rel)) if storeA.head(rel) \
-                else open(os.path.join(A, rel), "rb").read()
-            if not args.dry_run:
-                _atomic_write(os.path.join(B, rel), data)
-                record_note(storeB, B, rel, data)
-            note_action(f"project {nameA}->{nameB}  {rel}")
+def parse_merge_rules(text):
+    """Lines of `LEFT <-> RIGHT : selector` (or `->` one-way); `#` comments."""
+    rules = []
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
             continue
-        if inB and not inA:
-            data = storeB.read_object(storeB.head(rel)) if storeB.head(rel) \
-                else open(os.path.join(B, rel), "rb").read()
-            if not args.dry_run:
-                _atomic_write(os.path.join(A, rel), data)
-                record_note(storeA, A, rel, data)
-            note_action(f"project {nameB}->{nameA}  {rel}")
-            continue
-
-        # present in both: make sure each side's current content is recorded,
-        # so heads reflect on-disk reality before we compare.
-        if not args.dry_run:
-            record_note(storeA, A, rel)
-            record_note(storeB, B, rel)
-        headA, headB = storeA.head(rel), storeB.head(rel)
-        if headA is None or headB is None:
-            # no history yet (dry-run before any record) -- compare bytes
-            da = open(os.path.join(A, rel), "rb").read()
-            db = open(os.path.join(B, rel), "rb").read()
-            if da != db:
-                note_action(f"DIVERGE (no history) {rel}")
-            continue
-
-        if headA == headB:
-            continue  # in sync
-
-        ancA = storeA.ancestor_hashes(rel, headA)
-        ancB = storeB.ancestor_hashes(rel, headB)
-        if headB in ancA and headA not in ancB:
-            # A descends from B's head -> A is ahead
-            data = storeA.read_object(headA)
-            if not args.dry_run:
-                _atomic_write(os.path.join(B, rel), data)
-                record_note(storeB, B, rel, data)
-            note_action(f"ff {nameA}->{nameB}   {rel}  {short(headB)}->{short(headA)}")
-        elif headA in ancB and headB not in ancA:
-            data = storeB.read_object(headB)
-            if not args.dry_run:
-                _atomic_write(os.path.join(A, rel), data)
-                record_note(storeA, A, rel, data)
-            note_action(f"ff {nameB}->{nameA}   {rel}  {short(headA)}->{short(headB)}")
+        if "<->" in line:
+            op, (left, rest) = "<->", line.split("<->", 1)
+        elif "->" in line:
+            op, (left, rest) = "->", line.split("->", 1)
         else:
-            # diverged: three-way from the most recent common ancestor
-            common = ancA & ancB
-            times = {**storeB.times(rel), **storeA.times(rel)}
-            base = max(common, key=lambda h: times.get(h, "")) if common else None
-            mine, theirs = storeA.read_object(headA), storeB.read_object(headB)
-            base_bytes = b""
-            if base is not None:
-                base_bytes = (storeA.read_object(base)
-                              if os.path.exists(storeA.object_path(base))
-                              else storeB.read_object(base))
-            merged, conflict = three_way(mine, base_bytes, theirs,
-                                         label_mine=nameA, label_theirs=nameB)
-            tag = "CONFLICT" if conflict else "merge"
-            if not args.dry_run:
-                # give each side the other's blob so both merge parents resolve
-                storeA.write_object(headB, theirs)
-                storeB.write_object(headA, mine)
-                _atomic_write(os.path.join(A, rel), merged)
-                _atomic_write(os.path.join(B, rel), merged)
-                record_note(storeA, A, rel, merged, parents=[headA, headB])
-                record_note(storeB, B, rel, merged, parents=[headA, headB])
-            note_action(f"{tag} {rel}  base {short(base)}  ({nameA} {short(headA)} / {nameB} {short(headB)})")
+            die(f"merge rule missing <-> or ->: {raw!r}")
+        if ":" not in rest:
+            die(f"merge rule missing ': selector': {raw!r}")
+        right, sel = rest.split(":", 1)
+        rules.append((op, left.strip(), right.strip(), sel.strip()))
+    return rules
+
+
+def _current_bytes(store, vault, path):
+    head = store.head(path)
+    if head is not None:
+        return store.read_object(head)
+    with open(os.path.join(vault, path), "rb") as f:
+        return f.read()
+
+
+def reconcile_pair(vault, store, pa, pb, labels, two_way=True, dry_run=False):
+    """Reconcile the note at `pa` with the note at `pb` -- both full paths under
+    the top dir, in the one store. Returns a one-line description, or None if
+    nothing needed doing."""
+    la, lb = labels
+    fa, fb = os.path.join(vault, pa), os.path.join(vault, pb)
+    inA, inB = os.path.exists(fa), os.path.exists(fb)
+
+    if inA and not inB:
+        if not dry_run:
+            record_note(store, vault, pa)          # baseline before projecting
+        data = _current_bytes(store, vault, pa)
+        if not dry_run:
+            _atomic_write(fb, data)
+            record_note(store, vault, pb, data)
+        return f"project {la}->{lb}  {pb}"
+    if inB and not inA:
+        if not two_way:
+            return None
+        if not dry_run:
+            record_note(store, vault, pb)
+        data = _current_bytes(store, vault, pb)
+        if not dry_run:
+            _atomic_write(fa, data)
+            record_note(store, vault, pa, data)
+        return f"project {lb}->{la}  {pa}"
+
+    # both exist: make heads reflect what's on disk before comparing
+    if not dry_run:
+        record_note(store, vault, pa)
+        record_note(store, vault, pb)
+    headA, headB = store.head(pa), store.head(pb)
+    if headA is None or headB is None or headA == headB:
+        return None
+
+    ancA = store.ancestor_hashes(pa, headA)
+    ancB = store.ancestor_hashes(pb, headB)
+    if headB in ancA and headA not in ancB:
+        data = store.read_object(headA)
+        if not dry_run:
+            _atomic_write(fb, data)
+            record_note(store, vault, pb, data)
+        return f"ff {la}->{lb}  {pb}  {short(headB)}->{short(headA)}"
+    if headA in ancB and headB not in ancA:
+        if not two_way:
+            return None
+        data = store.read_object(headB)
+        if not dry_run:
+            _atomic_write(fa, data)
+            record_note(store, vault, pa, data)
+        return f"ff {lb}->{la}  {pa}  {short(headA)}->{short(headB)}"
+
+    # diverged: three-way from the most recent common ancestor
+    common = ancA & ancB
+    times = store.times(pa)
+    times.update(store.times(pb))
+    base = max(common, key=lambda h: times.get(h, "")) if common else None
+    mine, theirs = store.read_object(headA), store.read_object(headB)
+    base_bytes = store.read_object(base) if base is not None else b""
+    merged, conflict = three_way(mine, base_bytes, theirs,
+                                 label_mine=la, label_theirs=lb)
+    if not dry_run:
+        _atomic_write(fa, merged)
+        _atomic_write(fb, merged)
+        record_note(store, vault, pa, merged, parents=[headA, headB])
+        record_note(store, vault, pb, merged, parents=[headA, headB])
+    tag = "CONFLICT" if conflict else "merge"
+    return f"{tag} {pa} <> {pb}  base {short(base)}"
+
+
+def apply_merges(vault, store, rules, dry_run=False, log=print):
+    """Apply every rule once. Returns the number of reconcile actions taken."""
+    n = 0
+    for op, left, right, sel in rules:
+        two_way = op == "<->"
+        lt, rt = os.path.join(vault, left), os.path.join(vault, right)
+        rels = select(lt, sel) | select(rt, sel)
+        la, lb = os.path.basename(left) or left, os.path.basename(right) or right
+        for rel in sorted(rels):
+            msg = reconcile_pair(vault, store,
+                                 os.path.join(left, rel), os.path.join(right, rel),
+                                 (la, lb), two_way, dry_run)
+            if msg:
+                log(msg)
+                n += 1
+    return n
+
+
+def cmd_merge(args):
+    vault = os.path.abspath(args.topdir)
+    if not os.path.isdir(vault):
+        die(f"not a directory: {vault}")
+    store = Store.for_vault(args.store_root, vault)
+    store.ensure()
+    with open(args.merges, encoding="utf-8") as f:
+        rules = parse_merge_rules(f.read())
+    n = apply_merges(vault, store, rules, dry_run=args.dry_run)
+    print(f"{'(dry-run) ' if args.dry_run else ''}{n} reconcile action(s)")
 
 
 # --- watch (inotify daemon) ------------------------------------------------
@@ -536,6 +594,11 @@ def cmd_watch(args):
     store = Store.for_vault(args.store_root, vault)
     store.ensure()
 
+    merge_rules = None
+    if args.merges:
+        with open(args.merges, encoding="utf-8") as f:
+            merge_rules = parse_merge_rules(f.read())
+
     inotify = INotify()
     watch_mask = flags.CLOSE_WRITE | flags.MOVED_TO | flags.CREATE
     wd_to_dir = {}
@@ -563,10 +626,14 @@ def cmd_watch(args):
     if versioned:
         print(f"first version created for {versioned} untracked note(s)", flush=True)
 
+    if merge_rules:
+        apply_merges(vault, store, merge_rules)   # reconcile once on startup
+
     pending = set()
     first = last = None
     print(f"watching {vault}  ({len(wd_to_dir)} dirs, quiet={args.quiet}s, "
-          f"max={args.max_secs}s) -- ctrl-c to stop", flush=True)
+          f"max={args.max_secs}s"
+          f"{', merging' if merge_rules else ''}) -- ctrl-c to stop", flush=True)
     try:
         while True:
             if pending:
@@ -580,6 +647,8 @@ def cmd_watch(args):
                     flush_pending(store, vault, pending)
                     pending.clear()
                     first = None
+                    if merge_rules:
+                        apply_merges(vault, store, merge_rules)
                 continue
             for event in events:
                 base = wd_to_dir.get(event.wd)
@@ -623,11 +692,10 @@ def main(argv=None):
     ps.add_argument("selector", help="e.g. 'children(my possessions)'")
     ps.set_defaults(func=cmd_select)
 
-    pm = sub.add_parser("merge", help="reconcile two vaults")
-    pm.add_argument("vault_a")
-    pm.add_argument("vault_b")
+    pm = sub.add_parser("merge", help="apply a merges file once (reconcile subtrees)")
+    pm.add_argument("topdir")
     pm.add_argument("--store-root", required=True)
-    pm.add_argument("--selector", help="limit to this set (evaluated on both)")
+    pm.add_argument("--merges", required=True, help="merges rules file")
     pm.add_argument("--dry-run", action="store_true")
     pm.set_defaults(func=cmd_merge)
 
@@ -639,14 +707,21 @@ def main(argv=None):
                     help="record a note after this many idle seconds (default 300)")
     pw.add_argument("--max-secs", type=float, default=900.0, dest="max_secs",
                     help="force a record after a burst this long (default 900)")
+    pw.add_argument("--merges", help="merges rules file: reconcile after edits settle")
     pw.add_argument("--debug", action="store_true")
     pw.set_defaults(func=cmd_watch)
 
-    pl = sub.add_parser("log", help="show recorded history")
+    pl = sub.add_parser("log", help="list the versions of a note (or all notes)")
     pl.add_argument("vault")
     pl.add_argument("path", nargs="?")
     pl.add_argument("--store-root", required=True)
     pl.set_defaults(func=cmd_log)
+
+    psh = sub.add_parser("show", help="output a note's contents at a version hash")
+    psh.add_argument("vault")
+    psh.add_argument("hash", help="version hash from `log` (a prefix is fine)")
+    psh.add_argument("--store-root", required=True)
+    psh.set_defaults(func=cmd_show)
 
     args = p.parse_args(argv)
     args.func(args)
