@@ -8,11 +8,13 @@ purplerock-vault keeps track of versions markdown files at the change and allows
 
 This is AI-generated and unreviewed and I have not used it. I suggest reviewing the code and testing before using it in production.
 
+## Alternatives and prior work
 
-## Why not git?
+Obsidian ahs some sort of paid service for syncing. I don't want ot pay for it and don't 
+
+You oculd use git.
 There are tools to use Obsidian with vault.
 It will break and then be an utter pain to fix that is hard to understand.
-
 
 ## Versioning
 Files can diverge. The way we deal with this is keeping track of versions of a file and their parents automatically. If one machine changes one file bit by bit to another version. We know that we can replay those chnges on another machine.
